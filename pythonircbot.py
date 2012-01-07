@@ -158,17 +158,23 @@ class _BotReceiveThread(threading.Thread):
 			return "continue"
 	
 	def _modeset(self, line):
-		matchModeset = re.compile('^:.*\+([A-Za-z]) %s$' % self._bot._nick).search(line)
+		matchModeset = re.compile('^:.* MODE (.*) \+([A-Za-z]) %s$' % self._bot._nick).search(line)
 		if matchModeset:
+			channel = matchModeset.group(1).upper()
+			mode = matchModeset.group(2)
 			# Mode set
-			self._bot._modes.append(matchModeset.group(1))
+			if channel not in self._bot._modes:
+				self._bot._modes[channel] = []
+			self._bot._modes[channel].append(mode)
 			return "continue"
 	
 	def _modeunset(self, line):
-		matchModeunset = re.compile('^:.*-([A-Za-z]) %s$' % self._bot._nick).search(line)
+		matchModeunset = re.compile('^:.* MODE (.*) -([A-Za-z]) %s$' % self._bot._nick).search(line)
 		if matchModeunset:
+			channel = matchModeunset.group(1).upper()
+			mode = matchModeunset.group(2)
 			# Mode unset
-			self._bot._modes.remove(matchModeunset.group(1))
+			self._bot._modes[channel].remove(mode)
 			return "continue"
 
 class Bot(object):
@@ -186,8 +192,7 @@ class Bot(object):
 		self._responseFunctions = []
 		self._responseFunctionsLock = threading.Lock()
 		
-		self._channels = []
-		self._modes = []
+		self._modes = dict()
 	
 	def connect(self, host, port=6667, verbose=False, sleepTime=1, maxItems=4):
 		"""
@@ -251,6 +256,18 @@ class Bot(object):
 		# Connect again
 		self.connect(self._host, self._port, self._verbose, self._sleepTime, self._maxItems)
 	
+	def getModes(self, channel):
+		"""
+		Returns the current modes of the bot in the channel.
+		
+		Arguments:
+		- channel: channel you want the modes of
+		"""
+		if channel.upper() in self._modes:
+			return self._modes[channel.upper()]
+		else:
+			return []
+	
 	"""
 	IRC commands
 	"""
@@ -272,7 +289,6 @@ class Bot(object):
 		- channel: Channel name
 		"""
 		self._s._send("JOIN %s" % channel)
-		self._channels.append(channel.upper())
 	
 	def partChannel(self, channel):
 		"""
@@ -282,7 +298,6 @@ class Bot(object):
 		- channel: Channel name
 		"""
 		self._s._send("PART %s" % channel)
-		self._channels.remove(channel.upper())
 	
 	def setAway(self, message=''):
 		"""
