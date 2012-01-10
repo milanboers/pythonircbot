@@ -22,15 +22,28 @@ to handle messages, and abstracts many IRC commands.
 """
 
 __author__ = 'Milan Boers'
-__version__ = '1.0'
+__version__ = '1.1'
 
 import socket
 import threading
-import thread
 import re
 import copy
 import time
 import Queue
+
+class _PyEvent(object):
+	"""Own internal event implementation"""
+	def __init__(self, *args, **kwargs):
+		super(_PyEvent, self).__init__(*args, **kwargs)
+		
+		self.subscribers = []
+	
+	def emit(self, *args, **kwargs):
+		for subscriber in self.subscribers:
+			subscriber(*args, **kwargs)
+	
+	def connect(self, func):
+		self.subscribers.append(func)
 
 class _SuperSocket(object):
 	"""Socket with flooding control"""
@@ -41,42 +54,66 @@ class _SuperSocket(object):
 		self._maxItems = maxItems
 		self._verbose = verbose
 		self._messageQueue = Queue.Queue(self._maxItems)
+		self._quit = False
+		
+		self._shutdownEvent = _PyEvent()
 		
 		self._s = socket.socket()
-		
-		# Start the sender thread
-		thread.start_new_thread(self._senderThread, ())
 	
 	def _senderThread(self):
-		while True:
+		while not self._quit:
+			# Block until item is available (might not happen when disconnected, then this thread is a zombie)
 			try:
-				# Block until item is available
-				data = self._messageQueue.get(True)
+				data = self._messageQueue.get(True, 5)
 				self._s.send(data + "\r\n")
 				if self._verbose:
 					print "SENT: ", data
 				time.sleep(self._sleepTime)
+			except Queue.Empty:
+				pass
 			except:
-				# Socket not alive anymore
-				break
+				self._die()
 	
 	def _connect(self, host, port):
-		self._s.connect((host, port))
+		# Try to connect over and over until it worked
+		try:
+			if self._verbose:
+				print "NOTE:\tTrying to connect..."
+			self._s.connect((host, port))
+			# Start the sender thread
+			t = threading.Thread(target=self._senderThread)
+			t.daemon = True
+			t.start()
+		except:
+			time.sleep(5)
+			self._connect(host, port)
 	
 	def _send(self, data):
-		if self._messageQueue.qsize() >= self._maxItems:
-			self._messageQueue = Queue.Queue(self._maxItems)
+		try:
+			self._messageQueue.put(data, False)
+		except Queue.Full:
 			if self._verbose:
-				print "OVERFLOWN. EMPTYING MESSAGE QUEUE."
-		else:
-			# Put item onto the queue
-			self._messageQueue.put(data)
+				print "NOTE:\tMessage queue full."
 	
 	def _recv(self):
-		return self._s.recv(1024).rstrip('\r\n')
+		try:
+			data = self._s.recv(1024)
+			if not data:
+				self._die()
+			else:
+				data = data.rstrip('\r\n')
+				return data
+		except socket.error:
+			self._die()
 	
 	def _close(self):
 		self._s.close()
+	
+	def _die(self):
+		if self._verbose:
+			print "NOTE:\tSocket dead. Going to reconnect."
+		self._quit = True
+		self._shutdownEvent.emit()
 
 class _BotReceiveThread(threading.Thread):
 	"""Thread in which the bot handles received messages"""
@@ -85,39 +122,71 @@ class _BotReceiveThread(threading.Thread):
 		
 		self._bot = bot
 		self._verbose = verbose
-		self._connected = True
+		self._quit = False
 		
-		# Event to fire when the thread is about to shut down
+		# Event to fire when the thread wants to stop
 		self._shutdownEvent = threading.Event()
-		
-		self._namesList = []
-		self._namesHandled = threading.Event()
+		# Event to fire when channel was joined
+		self._joinedEvent = _PyEvent()
+		# Event to fire when channel was parted
+		self._partedEvent = _PyEvent()
+		# Event to fire when the list of names has been updated
+		self._updateNames = _PyEvent()
+		# Event to fire when the channel topic has changed
+		self._updateTopic = _PyEvent()
+		# Event to fire when a user mode was set
+		self._userModeSet = _PyEvent()
+		# Event to fire when a user mode was unset
+		self._userModeUnset = _PyEvent()
 	
 	def run(self):
-		while self._connected:
-			line = self._bot._s._recv()
+		while not self._quit:
+			try:
+				lines = self._bot._s._recv().splitlines()
+			except AttributeError:
+				self._die()
 			
-			if self._verbose:
-				print "RECV: ", line
-			
-			if self._privMsg(line):
-				continue
-			if self._pong(line):
-				continue
-			if self._quit(line):
-				continue
-			if self._modeset(line):
-				continue
-			if self._modeunset(line):
-				continue
-			if self._names(line):
-				continue
+			for line in lines:
+				if self._verbose:
+					print "RECV: ", line
+				
+				if self._privMsg(line):
+					continue
+				if self._joinChannel(line):
+					continue
+				if self._partChannel(line):
+					continue
+				if self._pong(line):
+					continue
+				if self._quitM(line):
+					continue
+				if self._modeset(line):
+					continue
+				if self._modeunset(line):
+					continue
+				if self._names(line):
+					continue
+				if self._topic(line):
+					continue
 	
-	def _quit(self, line):
+	def _die(self):
+		self._quit = True
+		self._shutdownEvent.set()
+	
+	def _joinChannel(self, line):
+		matchJoin = re.compile('^:(.*)!.* JOIN (.*)').search(line)
+		if matchJoin:
+			self._joinedEvent.emit(matchJoin.group(1), matchJoin.group(2))
+	
+	def _partChannel(self, line):
+		matchPart = re.compile('^:(.*)!.* PART (.*)').search(line)
+		if matchPart:
+			self._partedEvent.emit(matchPart.group(1), matchPart.group(2))
+	
+	def _quitM(self, line):
 		matchQuit = re.compile('^:%s!.* QUIT :' % self._bot._nick).search(line)
 		if matchQuit:
-			self._connected = False
-			self._shutdownEvent.set()
+			self._die()
 	
 	def _names(self, line):
 		matchNames = re.compile('^:.* 353 %s = (.*) :(.*)' % self._bot._nick).search(line)
@@ -126,11 +195,30 @@ class _BotReceiveThread(threading.Thread):
 			channel = matchNames.group(1)
 			names = matchNames.group(2)
 			
-			namesList = re.sub('\@|\+', '', names)
-			namesList = namesList.split(' ')
-			self._namesList = namesList
+			opsSet = set()
+			voicesSet = set()
+			namesSet = set()
 			
-			self._namesHandled.set()
+			names = names.split(' ')
+			for name in names:
+				if name[0] == '@':
+					opsSet.add(name[1:])
+					namesSet.add(name[1:])
+				elif name[0] == '+':
+					voicesSet.add(name[1:])
+					namesSet.add(name[1:])
+				else:
+					namesSet.add(name)
+			
+			self._updateNames.emit(channel, namesSet, opsSet, voicesSet)
+	
+	def _topic(self, line):
+		matchTopic = re.compile('^:.* 332 %s (.*) :(.*)' % self._bot._nick).search(line)
+		if matchTopic:
+			channel = matchTopic.group(1)
+			topic = matchTopic.group(2)
+			
+			self._updateTopic.emit(channel, topic)
 	
 	def _privMsg(self, line):
 		matchPrivmsg = re.compile('^:(.*)!~(.*) PRIVMSG (.*) :(.*)').search(line)
@@ -145,7 +233,11 @@ class _BotReceiveThread(threading.Thread):
 				_responseFunctions = copy.copy(self._bot._responseFunctions)
 			
 			for func in _responseFunctions:
-				thread.start_new_thread(func, (rmsg, nick, client, channel))
+				if func['thread']:
+					t = threading.Thread(target=func['func'], args=(rmsg, nick, client, channel))
+					t.start()
+				else:
+					func(rmsg, nick, client, channel)
 			
 			# Return a string, just to make sure it doesn't return None
 			return "continue"
@@ -158,23 +250,21 @@ class _BotReceiveThread(threading.Thread):
 			return "continue"
 	
 	def _modeset(self, line):
-		matchModeset = re.compile('^:.* MODE (.*) \+([A-Za-z]) %s$' % self._bot._nick).search(line)
+		matchModeset = re.compile('^:.* MODE (.*) \+([A-Za-z]) (.*)$').search(line)
 		if matchModeset:
-			channel = matchModeset.group(1).upper()
+			channel = matchModeset.group(1)
 			mode = matchModeset.group(2)
-			# Mode set
-			if channel not in self._bot._modes:
-				self._bot._modes[channel] = []
-			self._bot._modes[channel].append(mode)
+			nick = matchModeset.group(3)
+			self._userModeSet.emit(channel, nick, mode)
 			return "continue"
 	
 	def _modeunset(self, line):
-		matchModeunset = re.compile('^:.* MODE (.*) -([A-Za-z]) %s$' % self._bot._nick).search(line)
+		matchModeunset = re.compile('^:.* MODE (.*) -([A-Za-z]) (.*)$').search(line)
 		if matchModeunset:
-			channel = matchModeunset.group(1).upper()
+			channel = matchModeunset.group(1)
 			mode = matchModeunset.group(2)
-			# Mode unset
-			self._bot._modes[channel].remove(mode)
+			nick = matchModeunset.group(3)
+			self._userModeUnset.emit(channel, nick, mode)
 			return "continue"
 
 class Bot(object):
@@ -188,13 +278,14 @@ class Bot(object):
 		self._nick = nickname
 		
 		self._connected = False
+		self._connecting = False
+		
+		self._disconnectEvent = threading.Event()
 		
 		self._responseFunctions = []
 		self._responseFunctionsLock = threading.Lock()
-		
-		self._modes = dict()
 	
-	def connect(self, host, port=6667, verbose=False, sleepTime=1, maxItems=4):
+	def connect(self, host, port=6667, verbose=True, sleepTime=0.8, maxItems=4, channels=[]):
 		"""
 		Connects the bot to a server. Every bot can connect to only one server.
 		If you want your bot to be on multiple servers, create multiple Bot objects.
@@ -205,28 +296,52 @@ class Bot(object):
 		- verbose: If True, prints all the received and sent data
 		- sleepTime: Minimum time in seconds between two sent messages (used for flood control)
 		- maxItems: Maximum items in the queue. Queue is emptied after this amount is reached. 0 means unlimited. (used for flood control)
+		- channels: Channels to immediately join
 		"""
 		if self._connected:
-			raise Exception("Already connected. Can't connect twice.")
-		
-		self._verbose = verbose
-		self._host = host
-		self._port = port
-		self._sleepTime = sleepTime
-		self._maxItems = maxItems
-		
-		self._disconnectEvent = threading.Event()
-		
-		self._s = _SuperSocket(self._sleepTime, self._maxItems, self._verbose)
-		self._s._connect(self._host, self._port)
-		self._connected = True
-		
-		self.rename(self._nick)
-		self._s._send("USER %s %s %s :%s" % (self._nick, self._nick, self._nick, self._nick))
-		
-		# Run the main loop in another thread
-		self._receiveThread = _BotReceiveThread(self, self._verbose)
-		self._receiveThread.start()
+			if self._verbose:
+				print "NOTE:\tAlready connected. Can't connect twice."
+		elif self._connecting:
+			if self._verbose:
+				print "NOTE:\tAlready trying to connect."
+		else:
+			self._connecting = True
+			
+			self._verbose = verbose
+			self._host = host
+			self._port = port
+			self._sleepTime = sleepTime
+			self._maxItems = maxItems
+			self._modes = dict()
+			
+			self._channels = dict()
+			for channel in channels:
+				self._channels[channel.upper()] = dict()
+			
+			self._s = _SuperSocket(self._sleepTime, self._maxItems, self._verbose)
+			self._s._shutdownEvent.connect(self.reconnect)
+			self._s._connect(self._host, self._port)
+			self._connected = True
+			
+			self.rename(self._nick)
+			self._s._send("USER %s %s %s :%s" % (self._nick, self._nick, self._nick, self._nick))
+			
+			# Run the main loop in another thread
+			self._receiveThread = _BotReceiveThread(self, self._verbose)
+			self._receiveThread.daemon = True
+			self._receiveThread._joinedEvent.connect(self._joinedChannel)
+			self._receiveThread._partedEvent.connect(self._partedChannel)
+			self._receiveThread._updateNames.connect(self._updateNames)
+			self._receiveThread._updateTopic.connect(self._updateTopic)
+			self._receiveThread._userModeSet.connect(self._userModeSet)
+			self._receiveThread._userModeUnset.connect(self._userModeUnset)
+			self._receiveThread.start()
+			
+			# Join initial channels
+			for channel in channels:
+				self.joinChannel(channel)
+			
+			self._connecting = False
 	
 	def disconnect(self, message=''):
 		"""
@@ -237,24 +352,30 @@ class Bot(object):
 		"""
 		self._s._send("QUIT :%s" % message)
 		# Wait for the thread to be finished
-		self._receiveThread._shutdownEvent.wait()
+		self._receiveThread._shutdownEvent.wait(5)
+		self._s._quit = True
+		self._connected = False
 		# Fire disconnected event
 		self._disconnectEvent.set()
-		self._connected = False
 	
-	def reconnect(self, message=''):
+	def reconnect(self, message='', rejoin=True):
 		"""
 		Reconnects the bot to the server. Note that this does not reconnect to channels.
 		
 		Arguments:
 		- message: Message to show when quitting.
+		- rejoin: Rejoin channels
 		"""
 		self._s._send("QUIT :%s" % message)
 		# Wait for the thread to be finished
-		self._receiveThread._shutdownEvent.wait()
+		self._receiveThread._shutdownEvent.wait(5)
+		self._s._quit = True
 		self._connected = False
 		# Connect again
-		self.connect(self._host, self._port, self._verbose, self._sleepTime, self._maxItems)
+		if rejoin:
+			self.connect(self._host, self._port, self._verbose, self._sleepTime, self._maxItems, self._channels.keys())
+		else:
+			self.connect(self._host, self._port, self._verbose, self._sleepTime, self._maxItems)
 	
 	def getModes(self, channel):
 		"""
@@ -266,7 +387,7 @@ class Bot(object):
 		if channel.upper() in self._modes:
 			return self._modes[channel.upper()]
 		else:
-			return []
+			return set()
 	
 	"""
 	IRC commands
@@ -290,6 +411,12 @@ class Bot(object):
 		"""
 		self._s._send("JOIN %s" % channel)
 	
+	def _joinedChannel(self, nick, channel):
+		if nick == self._nick:
+			self._channels[channel.upper()] = dict()
+		else:
+			self._channels[channel.upper()]['names'].add(nick)
+	
 	def partChannel(self, channel):
 		"""
 		Parts a channel.
@@ -298,6 +425,12 @@ class Bot(object):
 		- channel: Channel name
 		"""
 		self._s._send("PART %s" % channel)
+	
+	def _partedChannel(self, nick, channel):
+		if nick == self._nick:
+			del self._channels[channel.upper()]
+		else:
+			self._channels[channel.upper()]['names'].remove(nick)
 	
 	def setAway(self, message=''):
 		"""
@@ -392,14 +525,74 @@ class Bot(object):
 		Arguments:
 		- channel: Channel name.
 		"""
-		self._receiveThread._namesHandled.clear()
-		self._s._send("NAMES %s" % channel)
-		self._receiveThread._namesHandled.wait(5)
-		names = copy.copy(self._receiveThread._namesList)
-		self._receiveThread._namesList = []
-		return names
+		try:
+			return self._channels[channel.upper()]['names']
+		except KeyError:
+			if self._verbose:
+				print "NOTE:\tNames of unjoined/unexisting channel requested."
 	
-	def addMsgHandler(self, function, message=".*", channel='.*', nickname='.*', client='.*', messageFlags=0, channelFlags=0, nicknameFlags=0, clientFlags=0):
+	def _updateNames(self, channel, namesSet, opsSet, voicesSet):
+		self._channels[channel.upper()]['names'] = namesSet
+		self._channels[channel.upper()]['ops'] = opsSet
+		self._channels[channel.upper()]['voices'] = voicesSet
+	
+	def _userModeSet(self, channel, nick, mode):
+		if mode == 'o':
+			self._channels[channel.upper()]['ops'].add(nick)
+		elif mode == 'v':
+			self._channels[channel.upper()]['voices'].add(nick)
+		if nick == self._nick:
+			if not channel.upper() in self._modes:
+				self._modes[channel.upper()] = set()
+			self._modes[channel.upper()].add(mode)
+	
+	def _userModeUnset(self, channel, nick, mode):
+		if mode == 'o':
+			self._channels[channel.upper()]['ops'].remove(nick)
+		elif mode == 'v':
+			self._channels[channel.upper()]['voices'].remove(nick)
+		if nick == self._nick:
+			self._modes[channel.upper()].remove(mode)
+	
+	def getOps(self, channel):
+		"""
+		Gets the nicknames of all the ops in a channel.
+		
+		Arguments:
+		- channel: Channel name.
+		"""
+		
+		try:
+			return self._channels[channel.upper()]['ops']
+		except KeyError:
+			if self._verbose:
+				print "NOTE:\tOps of unjoined/unexisting channel requested."
+	
+	def getVoices(self, channel):
+		"""
+		Gets the nicknames of all the voices in a channel.
+		
+		Arguments:
+		- channel: Channel name.
+		"""
+		
+		try:
+			return self._channels[channel.upper()]['voices']
+		except KeyError:
+			if self._verbose:
+				print "NOTE:\tVoices of unjoined/unexisting channel requested."
+	
+	def getTopic(self, channel):
+		try:
+			return self._channels[channel.upper()]['topic']
+		except KeyError:
+			if self._verbose:
+				print "NOTE:\tTopic of unjoined/unexisting channel requested."
+	
+	def _updateTopic(self, channel, topic):
+		self._channels[channel.upper()]['topic'] = topic
+	
+	def addMsgHandler(self, function, message=".*", channel='.*', nickname='.*', client='.*', messageFlags=0, channelFlags=0, nicknameFlags=0, clientFlags=0, thread=True):
 		"""
 		Adds a function to the list of functions that should be executed on every received message.
 		Please keep in mind that the functions are all executed concurrently.
@@ -415,6 +608,7 @@ class Bot(object):
 		- channelFlags: Flags for the channel regex, as documented here: http://docs.python.org/library/re.html#re.compile
 		- nicknameFlags: Flags for the nickname regex, as documented here: http://docs.python.org/library/re.html#re.compile
 		- clientFlags: Flags for the client regex, as documented here: http://docs.python.org/library/re.html#re.compile
+		- thread: Execute function in seperate thread
 		
 		The function should have 5 arguments:
 		- message: The first argument will be the message that was received.
@@ -425,8 +619,12 @@ class Bot(object):
 		"""
 		with self._responseFunctionsLock:
 			responseFunction = lambda rmsg, rnick, rclient, rchannel: self._responseFunction(function, rmsg, rnick, rclient, rchannel, message, channel, nickname, client, messageFlags, channelFlags, nicknameFlags, clientFlags)
-			self._responseFunctions.append(responseFunction)
-			return responseFunction
+			responseFunctionDict = {
+				'func': responseFunction,
+				'thread': thread
+			}
+			self._responseFunctions.append(responseFunctionDict)
+			return responseFunctionDict
 	
 	def removeMsgHandler(self, responseFunction):
 		"""
